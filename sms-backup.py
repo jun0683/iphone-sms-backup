@@ -122,7 +122,10 @@ def setup_and_parse(parser):
     input_group.add_argument("-i", "--input", dest="db_file", metavar="FILE",
             help="Name of SMS db file. Optional. Default: Script will find "
                  "and use db in standard backup location.")
-            
+    
+    input_group.add_argument("-6", dest="six", 
+            action="store_true", default=False, help="Assume DB is in iOS6 format. Does not support -p/-e.")
+    
     args = parser.parse_args()
     return args
 
@@ -130,6 +133,7 @@ def strip(phone):
     """Remove all non-numeric digits in phone string."""
     if phone:
         return re.sub('[^\d]', '', phone)
+    return ''
 
 def trunc(phone):
     """Strip phone, then truncate it.  Return last 10 digits"""
@@ -284,6 +288,87 @@ def alias_map(aliases):
                 key = trunc(key) 
             amap[key] = alias.decode('utf-8')
     return amap
+
+def convert_address(row, me, alias_map, handles):
+    """
+    In iOS 6, Apple introduced a much simpler database. Find the iCloud
+    handle_id in row (a sqlite3.Row) and return a tuple of address
+    strings: (from_addr, to_addr).
+    
+    In an iMessage message, the address could be an email or a phone number,
+    and is found by looking up the `handle_id` field in the handle table.
+    
+    Next, look for alias in alias_map.  Otherwise, use formatted address.
+    
+    Use `is_from_me` to determine direction of the message.
+        
+    """
+    if isinstance(me, str): 
+        me = me.decode('utf-8')
+        
+    # If madrid_handle is phone number, have to truncate it.
+    handle = handles.get(row['handle_id'], '?')
+    email_match = re.search('@', handle)
+    if not email_match:
+        handle = trunc(handle)
+    
+    if handle in alias_map:
+        other = alias_map[handle]
+    else:
+        other = format_address(handle)
+
+    if row['is_from_me'] == 0:
+        from_addr = other
+        to_addr = me
+    elif row['is_from_me'] == 1:
+        from_addr = me
+        to_addr = other
+        
+    return (from_addr, to_addr)
+
+def messages_for_ios6(conn, numbers, emails, identity, aliases, date_format):
+    """
+    Build the query for SMS and iMessage messages.
+    
+    In iOS 6, Apple changed the way the addresses are stored. They only store
+    a reference to the address in the message table. The reference is the `rowid`
+    of the actual `id` in the handle table. Because of this change, we remove the
+    ability to filter by number for now.
+
+    Because of inconsistently formatted phone numbers, we run both passed-in
+    numbers and numbers in DB through trunc() before comparing them.
+    
+    Returns: query (string)
+    """
+
+    handles = {}
+    cur = conn.cursor()
+    cur.execute("SELECT rowid, id FROM handle")
+    for row in cur:
+        handles[row['rowid']] = row['id']
+
+    query = """
+SELECT 
+    rowid, 
+    date, 
+    handle_id,
+    text,
+    is_from_me
+FROM message """
+    query = query + "\nORDER by rowid"
+
+    cur.execute(query)
+
+    for row in cur:
+        im_date = fix_imessage_date(row["date"])
+        fmt_date = convert_date(im_date, date_format)
+        fmt_from, fmt_to = convert_address(row, identity, aliases, handles)
+
+        yield {'date': fmt_date,
+               'from': fmt_from,
+               'to': fmt_to,
+               'text': clean_text_msg(row['text'])}
+
 
 def build_msg_query(numbers, emails):
     """
@@ -620,27 +705,32 @@ def main():
             conn = sqlite3.connect(COPY_DB)
             conn.row_factory = sqlite3.Row
             conn.create_function("TRUNC", 1, trunc)
-            cur = conn.cursor()
-            cur.execute(query, params)
-            logging.debug("Run query: %s" % (query))
-            logging.debug("With query params: %s" % (params,))
 
-            messages = []
-            for row in cur:
-                if row['is_madrid'] == 1:
-                    if skip_imessage(row): continue
-                    im_date = imessage_date(row)
-                    fmt_date = convert_date(im_date, args.date_format)
-                    fmt_from, fmt_to = convert_address_imessage(row, args.identity, aliases)
-                else:
-                    if skip_sms(row): continue
-                    fmt_date = convert_date(row['date'], args.date_format)
-                    fmt_from, fmt_to = convert_address_sms(row, args.identity, aliases)
-                msg = {'date': fmt_date,
-                       'from': fmt_from,
-                       'to': fmt_to,
-                       'text': clean_text_msg(row['text'])}
-                messages.append(msg)
+            def messages_for_ios4():
+                cur = conn.cursor()
+                cur.execute(query, params)
+                logging.debug("Run query: %s" % (query))
+                logging.debug("With query params: %s" % (params,))
+                for row in cur:
+                    if row['is_madrid'] == 1:
+                        if skip_imessage(row): continue
+                        im_date = imessage_date(row)
+                        fmt_date = convert_date(im_date, args.date_format)
+                        fmt_from, fmt_to = convert_address_imessage(row, args.identity, aliases)
+                    else:
+                        if skip_sms(row): continue
+                        fmt_date = convert_date(row['date'], args.date_format)
+                        fmt_from, fmt_to = convert_address_sms(row, args.identity, aliases)
+                    msg = {'date': fmt_date,
+                           'from': fmt_from,
+                           'to': fmt_to,
+                           'text': clean_text_msg(row['text'])}
+                    yield msg
+
+            if args.six:
+                messages = list(messages_for_ios6(conn, args.numbers, args.emails, args.identity, aliases, args.date_format))
+            else:
+                messages = list(messages_for_ios4())
         
             output(messages, args.output, args.format, args.header)
 
